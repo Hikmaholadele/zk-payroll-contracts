@@ -111,6 +111,20 @@ payroll_registry.register_company(
 
 ## Usage
 
+### Detecting Asset Allowlist Changes
+
+Clients that cache the supported payroll assets can poll the asset-specific
+revision without reading private payroll data:
+
+```rust
+let revision = payroll.get_asset_allowlist_revision(&asset);
+```
+
+The revision starts at `0`, increments when the asset's explicitly stored
+allowlist status changes, and remains unchanged when an admin repeats the
+current value. A client can refresh its supported-assets view only when this
+revision changes. Unknown assets return `0`.
+
 ### Register Employee with Private Salary
 
 ```rust

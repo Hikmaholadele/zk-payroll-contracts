@@ -738,6 +738,9 @@ pub enum DataKey {
     /// Redacted audit record for a payroll run that expired before
     /// finalization (#474).
     ExpiredRunRecord(u64),
+    /// Monotonic revision for changes to one asset's allowlist status (#523).
+    /// Absent means the asset has never had an explicit allowlist update.
+    AssetAllowlistRevision(Address),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -1635,9 +1638,20 @@ impl Payroll {
             .expect("Not initialized");
         addrs.admin.require_auth();
         Self::require_no_active_payroll_run(&e);
-        e.storage()
-            .persistent()
-            .set(&DataKey::AllowedAsset(asset.clone()), &allowed);
+        let allowed_key = DataKey::AllowedAsset(asset.clone());
+        let previous_allowed: Option<bool> = e.storage().persistent().get(&allowed_key);
+        e.storage().persistent().set(&allowed_key, &allowed);
+
+        if previous_allowed != Some(allowed) {
+            let revision_key = DataKey::AssetAllowlistRevision(asset.clone());
+            let revision = e
+                .storage()
+                .persistent()
+                .get::<_, u64>(&revision_key)
+                .unwrap_or(0)
+                .saturating_add(1);
+            e.storage().persistent().set(&revision_key, &revision);
+        }
 
         let mut assets: Vec<Address> =
             if let Some(stored) = e.storage().persistent().get(&DataKey::SupportedAssets) {
@@ -1669,6 +1683,20 @@ impl Payroll {
             .persistent()
             .get(&DataKey::AllowedAsset(asset))
             .unwrap_or(false)
+    }
+
+    /// Return the revision of an asset's allowlist status (#523).
+    ///
+    /// The counter starts at `0` and increments only when the asset's
+    /// explicitly stored allowlist value changes. Repeating the same value is
+    /// a no-op for this counter, so clients can safely poll it and refresh
+    /// supported-asset data only when the revision changes. Unknown assets
+    /// return `0` without revealing any payroll data.
+    pub fn get_asset_allowlist_revision(e: Env, asset: Address) -> u64 {
+        e.storage()
+            .persistent()
+            .get(&DataKey::AssetAllowlistRevision(asset))
+            .unwrap_or(0)
     }
 
     /// Return the payroll assets currently enabled for this employer contract.
