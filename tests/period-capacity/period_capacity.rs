@@ -6,6 +6,10 @@
 //! (`batch_process_payroll`), that usage counters are scoped correctly per
 //! period, and that the feature is fully opt-in (no policy configured means
 //! no behavior change for existing callers).
+//!
+//! Issue #578: only one payroll period may be active at a time, so tests
+//! that switch between period labels close the active period first via
+//! `close_capacity_period`.
 
 use payroll::{Payroll, PayrollClient};
 use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey};
@@ -317,6 +321,9 @@ fn test_period_counters_scoped_independently() {
     let failed_a = try_prepare_batch_fails(&ctx, 2, 1, 1_000i128);
     assert!(failed_a);
 
+    // #578: close the active period before opening period B.
+    ctx.payroll_client.close_capacity_period(&ctx.admin);
+
     // Opening a new period gives fresh (zeroed) counters, so the same batch
     // succeeds under period B even though the policy is unchanged.
     let period_b = Symbol::new(&ctx.env, "P2026_02");
@@ -342,11 +349,15 @@ fn test_reopening_a_period_resumes_its_existing_counters() {
     prepare_batch(&ctx, 1, 1, 1_000i128);
 
     let period_b = Symbol::new(&ctx.env, "P2026_02");
+    // #578: only one period may be active at a time.
+    ctx.payroll_client.close_capacity_period(&ctx.admin);
     ctx.payroll_client
         .open_capacity_period(&ctx.admin, &period_b);
     prepare_batch(&ctx, 2, 1, 1_000i128);
 
-    // Re-open period A: its usage counter should resume from 1, not reset to 0.
+    // #578: close the active period, then re-open period A: its usage
+    // counter should resume from 1, not reset to 0.
+    ctx.payroll_client.close_capacity_period(&ctx.admin);
     ctx.payroll_client
         .open_capacity_period(&ctx.admin, &period_a);
     prepare_batch(&ctx, 3, 1, 1_000i128);
@@ -379,6 +390,127 @@ fn test_unauthorized_caller_cannot_set_capacity_limits() {
         .payroll_client
         .try_set_capacity_limits(&outsider, &10u32, &10u32, &10_000i128);
     assert!(result.is_err());
+}
+
+/// Attempts to open a capacity period and returns whether the call failed.
+fn try_open_period_fails(ctx: &TestContext, period: &Symbol) -> bool {
+    ctx.payroll_client
+        .try_open_capacity_period(&ctx.admin, period)
+        .is_err()
+}
+
+// ── Issue #578: active payroll period uniqueness ────────────────────────────
+
+#[test]
+fn test_opening_first_period_succeeds_and_sets_current_period() {
+    let ctx = setup_test_context();
+    assert!(ctx.payroll_client.get_current_period().is_none());
+
+    let period = Symbol::new(&ctx.env, "P2026_01");
+    ctx.payroll_client.open_capacity_period(&ctx.admin, &period);
+
+    assert_eq!(ctx.payroll_client.get_current_period(), Some(period));
+}
+
+#[test]
+fn test_opening_a_second_period_while_one_is_active_fails() {
+    let ctx = setup_test_context();
+    let period_a = Symbol::new(&ctx.env, "P2026_01");
+    let period_b = Symbol::new(&ctx.env, "P2026_02");
+    ctx.payroll_client
+        .open_capacity_period(&ctx.admin, &period_a);
+
+    assert!(
+        try_open_period_fails(&ctx, &period_b),
+        "Opening a second period while one is active must be rejected"
+    );
+
+    // The active period must be unchanged after the rejected call.
+    assert_eq!(ctx.payroll_client.get_current_period(), Some(period_a));
+}
+
+#[test]
+#[should_panic(expected = "An active payroll period already exists")]
+fn test_opening_a_second_period_panics_with_actionable_message() {
+    let ctx = setup_test_context();
+    ctx.payroll_client
+        .open_capacity_period(&ctx.admin, &Symbol::new(&ctx.env, "P2026_01"));
+    ctx.payroll_client
+        .open_capacity_period(&ctx.admin, &Symbol::new(&ctx.env, "P2026_02"));
+}
+
+#[test]
+fn test_reopening_the_same_active_period_is_rejected() {
+    let ctx = setup_test_context();
+    let period = Symbol::new(&ctx.env, "P2026_01");
+    ctx.payroll_client.open_capacity_period(&ctx.admin, &period);
+
+    // Re-opening the currently active label is a no-op duplicate and must be
+    // rejected so the lifecycle stays unambiguous for off-chain consumers.
+    assert!(try_open_period_fails(&ctx, &period));
+    assert_eq!(ctx.payroll_client.get_current_period(), Some(period));
+}
+
+#[test]
+fn test_close_capacity_period_clears_active_period() {
+    let ctx = setup_test_context();
+    let period = Symbol::new(&ctx.env, "P2026_01");
+    ctx.payroll_client.open_capacity_period(&ctx.admin, &period);
+
+    ctx.payroll_client.close_capacity_period(&ctx.admin);
+
+    assert!(ctx.payroll_client.get_current_period().is_none());
+
+    // A new period can be opened after closing.
+    let next = Symbol::new(&ctx.env, "P2026_02");
+    ctx.payroll_client.open_capacity_period(&ctx.admin, &next);
+    assert_eq!(ctx.payroll_client.get_current_period(), Some(next));
+}
+
+#[test]
+fn test_close_without_active_period_fails() {
+    let ctx = setup_test_context();
+    let result = ctx.payroll_client.try_close_capacity_period(&ctx.admin);
+    assert!(
+        result.is_err(),
+        "Closing a period when none is active must fail"
+    );
+}
+
+#[test]
+fn test_close_capacity_period_requires_admin() {
+    let ctx = setup_test_context();
+    let outsider = Address::generate(&ctx.env);
+    ctx.payroll_client
+        .open_capacity_period(&ctx.admin, &Symbol::new(&ctx.env, "P2026_01"));
+
+    let result = ctx.payroll_client.try_close_capacity_period(&outsider);
+    assert!(result.is_err(), "Only the admin may close a period");
+
+    // The period must remain active after the unauthorized attempt.
+    assert!(ctx.payroll_client.get_current_period().is_some());
+}
+
+#[test]
+fn test_capacity_usage_survives_period_close_and_resume() {
+    let ctx = setup_test_context();
+    ctx.payroll_client
+        .set_capacity_limits(&ctx.admin, &2u32, &100u32, &1_000_000i128);
+
+    let period = Symbol::new(&ctx.env, "P2026_01");
+    ctx.payroll_client.open_capacity_period(&ctx.admin, &period);
+    prepare_batch(&ctx, 1, 1, 1_000i128);
+
+    // Closing the period must not wipe its usage counters.
+    ctx.payroll_client.close_capacity_period(&ctx.admin);
+    let usage = ctx.payroll_client.get_period_usage(&period);
+    assert_eq!(usage.batch_count, 1);
+
+    // Re-opening the same label resumes the existing counters: one more
+    // batch reaches the max_batches=2 limit, and a third is rejected.
+    ctx.payroll_client.open_capacity_period(&ctx.admin, &period);
+    prepare_batch(&ctx, 2, 1, 1_000i128);
+    assert!(try_prepare_batch_fails(&ctx, 3, 1, 1_000i128));
 }
 
 #[test]

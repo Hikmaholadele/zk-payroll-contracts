@@ -63,8 +63,9 @@ Not audited, by design:
   accepted; the accepting call is the audited change.
 - `initialize` is one-time setup and is already covered by the
   `("payroll", "initialized")` event.
-- Operational calls (`open_capacity_period`, payroll runs, drafts, disputes,
-  compliance holds, archival, pruning) are not configuration changes.
+- Operational calls (`open_capacity_period`, `close_capacity_period`, payroll
+  runs, drafts, disputes, compliance holds, archival, pruning) are not
+  configuration changes.
 
 ## Revision
 

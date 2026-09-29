@@ -908,6 +908,15 @@ pub fn emit_capacity_period_opened(e: &Env, period: Symbol) {
     );
 }
 
+/// Emitted when the admin closes the active payroll period so a new one can
+/// be opened (#578). Only the period label is exposed — no payroll values.
+pub fn emit_capacity_period_closed(e: &Env, period: Symbol) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "capacity_period_closed")),
+        period,
+    );
+}
+
 /// Emitted after a batch is accepted and its usage recorded against the
 /// active period's capacity counters (#338).
 pub fn emit_capacity_usage_recorded(

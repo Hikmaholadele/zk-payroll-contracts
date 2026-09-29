@@ -1302,7 +1302,7 @@ impl Payroll {
 
     /// Boolean convenience wrapper around `check_execution_initiator`
     /// (issue #620).
-    pub fn is_execution_initiator_authorized(e: Env, initiator: Address) -> bool {
+    pub fn is_execution_initiator(e: Env, initiator: Address) -> bool {
         execution_authorization::check(&e, &initiator).authorized
     }
 
@@ -4679,11 +4679,11 @@ impl Payroll {
     /// employee addresses or salary figures.
     pub fn get_draft_lock_owner(e: Env, draft_id: u64) -> Option<Address> {
         Self::validate_draft_id(draft_id);
-        let draft: PayrollRunDraft = e
-            .storage()
-            .persistent()
-            .get(&DataKey::RunDraft(draft_id))?;
-        if matches!(draft.state, RunDraftState::Finalized | RunDraftState::Submitted) {
+        let draft: PayrollRunDraft = e.storage().persistent().get(&DataKey::RunDraft(draft_id))?;
+        if matches!(
+            draft.state,
+            RunDraftState::Finalized | RunDraftState::Submitted
+        ) {
             Some(draft.admin)
         } else {
             None
@@ -5649,7 +5649,10 @@ impl Payroll {
             let amt = amounts.get(i).unwrap();
             if amt < minimum {
                 e.events().publish(
-                    (symbol_short!("payroll"), Symbol::new(e, "min_payout_violation")),
+                    (
+                        symbol_short!("payroll"),
+                        Symbol::new(e, "min_payout_violation"),
+                    ),
                     (minimum,),
                 );
                 panic!("Payout amount below minimum threshold");
@@ -5657,11 +5660,16 @@ impl Payroll {
         }
     }
 
-    /// Open a new payroll period for capacity accounting. Only the admin may
-    /// call. Usage counters are scoped per period label, so opening a period
-    /// that has never been used before starts with fresh (zeroed) counters;
-    /// re-opening a previously used period label resumes accumulating
-    /// against its existing counters.
+    /// Open a payroll period for capacity accounting. Only the admin may call.
+    ///
+    /// Issue #578: at most one period is active at a time. Opening a period
+    /// while another is still active panics with an actionable message; close
+    /// the active period first via `close_capacity_period`.
+    ///
+    /// Usage counters are scoped per period label and closing a period does not
+    /// clear them, so opening a label that has never been used starts with
+    /// fresh (zeroed) counters, while re-opening a previously used label
+    /// resumes accumulating against its existing counters.
     pub fn open_capacity_period(e: Env, admin: Address, period: Symbol) {
         let addrs: ContractAddresses = e
             .storage()
@@ -5674,11 +5682,57 @@ impl Payroll {
         admin.require_auth();
         Self::validate_symbol_not_empty(&e, &period, "period");
 
+        // Issue #578: at most one active payroll period. Opening a second
+        // period while one is still open would silently re-point capacity
+        // accounting and settlement-window enforcement to the new label,
+        // stranding the old period's pending runs and counters.
+        if let Some(active) = Self::get_current_period(e.clone()) {
+            if active == period {
+                panic!("Payroll period is already the active period");
+            }
+            panic!("An active payroll period already exists: close it before opening a new one");
+        }
+
         e.storage()
             .persistent()
             .set(&DataKey::CurrentPeriod, &period);
 
         payroll_events::emit_capacity_period_opened(&e, period);
+    }
+
+    /// Close the active payroll period (#578). Only the admin may call.
+    ///
+    /// Closing clears the period's capacity-accounting slot so a new period
+    /// can be opened. Per-period usage counters are preserved (re-opening
+    /// the same label later resumes its existing counters), and pending
+    /// runs prepared under the closed period keep their recorded period for
+    /// later settlement-window expiration lookups.
+    ///
+    /// Closing a period that is not active is rejected so the lifecycle
+    /// stays unambiguous; re-opening a label is always allowed once no
+    /// period is active.
+    ///
+    /// Emits `capacity_period_closed`.
+    pub fn close_capacity_period(e: Env, admin: Address) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let period: Symbol = e
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentPeriod)
+            .expect("No active payroll period to close");
+
+        e.storage().persistent().remove(&DataKey::CurrentPeriod);
+
+        payroll_events::emit_capacity_period_closed(&e, period);
     }
 
     /// Return the payroll period currently open for capacity accounting, if any.
@@ -8538,7 +8592,10 @@ mod tests {
 
         // 2. Finalized draft is locked -> returns Some(admin)
         payroll_client.finalize_run_draft(&admin, &draft_id);
-        assert_eq!(payroll_client.get_draft_lock_owner(&draft_id), Some(admin.clone()));
+        assert_eq!(
+            payroll_client.get_draft_lock_owner(&draft_id),
+            Some(admin.clone())
+        );
 
         // 3. Submitted draft remains locked -> returns Some(admin)
         payroll_client.submit_run_draft(&admin, &draft_id);

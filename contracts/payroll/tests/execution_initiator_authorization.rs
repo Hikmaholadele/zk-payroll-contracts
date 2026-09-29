@@ -27,7 +27,7 @@ fn initialized_contract_recognizes_the_registered_admin_as_initiator() {
     assert!(status.initialized);
     assert_eq!(status.initiator, admin);
     assert_eq!(status.role, ExecutionInitiatorRole::Authorized);
-    assert!(payroll.is_execution_initiator_authorized(&admin));
+    assert!(payroll.is_execution_initiator(&admin));
 }
 
 #[test]
@@ -40,7 +40,7 @@ fn a_non_admin_address_is_not_authorized() {
     assert!(!status.authorized);
     assert!(status.initialized);
     assert_eq!(status.role, ExecutionInitiatorRole::Unauthorized);
-    assert!(!payroll.is_execution_initiator_authorized(&outsider));
+    assert!(!payroll.is_execution_initiator(&outsider));
 }
 
 #[test]
@@ -55,7 +55,7 @@ fn uninitialized_contract_reports_not_initialized() {
     let status = client.check_execution_initiator(&anyone);
     assert!(!status.authorized);
     assert!(!status.initialized);
-    assert!(!client.is_execution_initiator_authorized(&anyone));
+    assert!(!client.is_execution_initiator(&anyone));
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn preflight_needs_no_authorization() {
 
     // A dashboard can ask the question without holding any signature.
     env.mock_auths(&[]);
-    assert!(payroll.is_execution_initiator_authorized(&admin));
+    assert!(payroll.is_execution_initiator(&admin));
     assert_eq!(payroll.get_execution_initiator(), Some(admin));
 }
 
@@ -121,7 +121,10 @@ fn execution_without_initiator_authorization_is_rejected() {
         &None,
     );
 
-    assert!(result.is_err(), "an execution must be rejected when its initiator is not authorized");
+    assert!(
+        result.is_err(),
+        "an execution must be rejected when its initiator is not authorized"
+    );
 }
 
 #[test]
@@ -182,9 +185,9 @@ fn admin_rotation_moves_execution_initiator_authority() {
     payroll.accept_admin_rotation(&new_admin);
 
     assert_eq!(payroll.get_execution_initiator(), Some(new_admin.clone()));
-    assert!(payroll.is_execution_initiator_authorized(&new_admin));
+    assert!(payroll.is_execution_initiator(&new_admin));
     assert!(
-        !payroll.is_execution_initiator_authorized(&previous_admin),
+        !payroll.is_execution_initiator(&previous_admin),
         "the previous admin must lose initiator authority after rotation"
     );
 }
