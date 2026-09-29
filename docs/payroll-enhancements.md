@@ -124,6 +124,42 @@ for amendment in amendments {
 }
 ```
 
+## Single Active Payroll Period (#578)
+
+**Purpose**: Guarantee that exactly one payroll period is active at a time, so
+`get_current_period()` is never ambiguous and every run, draft and capacity
+counter is attributed to one period.
+
+**Implementation**:
+- `open_capacity_period()` rejects a second period while one is already active
+- New admin-only `close_capacity_period()` clears the active period and emits `capacity_period_closed`
+- Only `DataKey::CurrentPeriod` is touched; per-period usage counters are keyed by period label and are untouched, so re-opening a period resumes its existing counters
+
+**Error Handling**:
+- Re-opening the period that is already active: `Payroll period is already the active period`
+- Opening a different period while one is active: `An active payroll period already exists: close it before opening a new one`
+- Closing with no active period: `No active payroll period to close`
+- `close_capacity_period()` requires the company admin's authorisation
+
+**Usage**:
+```rust
+// Open the first (or only) active period.
+payroll.open_capacity_period(admin, symbol!("P2026_02"));
+
+// Before moving to the next period, close the current one.
+payroll.close_capacity_period(admin);
+payroll.open_capacity_period(admin, symbol!("P2026_03"));
+```
+
+Period usage survives the close/re-open cycle, so closing a period does not
+reset `get_period_usage()` for that label:
+
+```rust
+payroll.close_capacity_period(admin);
+payroll.open_capacity_period(admin, symbol!("P2026_02"));
+let usage = payroll.get_period_usage(&symbol!("P2026_02")); // counters resume, not reset
+```
+
 ## Testing
 
 All features include:
@@ -136,6 +172,7 @@ Test files:
 - `tests/blacklist_validation_test.rs`
 - `tests/draft_expiration_audit_test.rs`
 - `tests/period_amendment_audit_test.rs`
+- `tests/period-capacity/period_capacity.rs` (active-period uniqueness)
 
 ## Compliance Notes
 
