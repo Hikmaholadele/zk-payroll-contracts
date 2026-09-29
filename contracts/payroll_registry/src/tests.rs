@@ -1,6 +1,6 @@
 use super::*;
 use soroban_sdk::testutils::{Address as _, Events};
-use soroban_sdk::{Env, IntoVal, String, Symbol, TryIntoVal};
+use soroban_sdk::{Env, IntoVal, String, Symbol, TryIntoVal, Val, Vec};
 
 const VALID_EMPLOYEE_WALLET: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 const BAD_CHECKSUM_EMPLOYEE_WALLET: &str =
@@ -17,6 +17,34 @@ fn setup_no_auth_mock() -> (Env, Address) {
     let env = Env::default();
     let contract_id = env.register_contract(None, PayrollRegistry);
     (env, contract_id)
+}
+
+/// Number of contract events recorded so far, in publication order.
+///
+/// `Env::events().all()` returns the XDR-backed `ContractEvents` type, so this
+/// is the supported way to count them again.
+fn event_count(env: &Env) -> usize {
+    env.events().all().events().len()
+}
+
+/// Topics of the contract event at `index`, in publication order.
+fn event_topics(env: &Env, index: usize) -> Vec<Val> {
+    let recorded = env.events().all();
+    let event = &recorded.events()[index];
+    let body = match &event.body {
+        soroban_sdk::xdr::ContractEventBody::V0(v0) => v0,
+    };
+    let topics: alloc::vec::Vec<Val> = body
+        .topics
+        .iter()
+        .map(|topic| {
+            topic
+                .clone()
+                .try_into_val(env)
+                .expect("event topic must decode to a host value")
+        })
+        .collect();
+    Vec::from_slice(env, &topics)
 }
 
 #[test]
@@ -138,12 +166,11 @@ fn test_add_employee_by_wallet_rejects_invalid_wallet_before_storage() {
     let commitment = BytesN::from_array(&env, &[1u8; 32]);
 
     let company_id = client.register_company(&admin, &treasury);
-    let before = env.events().all().len();
     let result = client.try_add_employee_by_wallet(&company_id, &bad_wallet, &commitment);
-    let after = env.events().all().len();
 
     assert!(result.is_err());
-    assert_eq!(after, before);
+    // A rejected call must not publish any event.
+    assert_eq!(event_count(&env), 0);
 }
 
 #[test]
@@ -389,6 +416,191 @@ fn test_reactivating_suspended_employee_restores_eligibility() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #615: employee eligibility status evaluation
+// ---------------------------------------------------------------------------
+
+/// Register a company with one employee and return both, for reuse below.
+fn setup_with_employee() -> (Env, PayrollRegistryClient<'static>, u64, Address) {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[7u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &employee, &commitment);
+    (env, client, company_id, employee)
+}
+
+#[test]
+fn test_evaluate_eligibility_reports_eligible_for_active_employee() {
+    let (_env, client, company_id, employee) = setup_with_employee();
+
+    let assessment = client.evaluate_eligibility(&company_id, &employee);
+
+    assert!(assessment.eligible, "an added employee starts Active");
+    assert_eq!(assessment.reason, EligibilityReason::Eligible);
+    assert_eq!(assessment.status, EmployeeStatus::Active);
+}
+
+#[test]
+fn test_evaluate_eligibility_reports_unregistered_for_unknown_address() {
+    let (env, client, company_id, _employee) = setup_with_employee();
+    let stranger = Address::generate(&env);
+
+    let assessment = client.evaluate_eligibility(&company_id, &stranger);
+
+    assert!(!assessment.eligible);
+    assert_eq!(assessment.reason, EligibilityReason::Unregistered);
+    // Never-set status still reports the documented `Incomplete` default.
+    assert_eq!(assessment.status, EmployeeStatus::Incomplete);
+}
+
+#[test]
+fn test_evaluate_eligibility_reports_suspended_with_remediation() {
+    let (_env, client, company_id, employee) = setup_with_employee();
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Suspended);
+
+    let assessment = client.evaluate_eligibility(&company_id, &employee);
+
+    assert!(!assessment.eligible);
+    assert_eq!(assessment.reason, EligibilityReason::Suspended);
+    assert_eq!(assessment.status, EmployeeStatus::Suspended);
+}
+
+#[test]
+fn test_evaluate_eligibility_reports_incomplete() {
+    let (_env, client, company_id, employee) = setup_with_employee();
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Incomplete);
+
+    let assessment = client.evaluate_eligibility(&company_id, &employee);
+
+    assert!(!assessment.eligible);
+    assert_eq!(assessment.reason, EligibilityReason::Incomplete);
+}
+
+#[test]
+fn test_evaluate_eligibility_reports_offboarded() {
+    let (_env, client, company_id, employee) = setup_with_employee();
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Offboarded);
+
+    let assessment = client.evaluate_eligibility(&company_id, &employee);
+
+    assert!(!assessment.eligible);
+    assert_eq!(assessment.reason, EligibilityReason::Offboarded);
+    assert_eq!(assessment.status, EmployeeStatus::Offboarded);
+}
+
+#[test]
+fn test_evaluate_eligibility_flags_removed_employee_despite_stale_active_status() {
+    // `remove_employee` deletes the record but leaves the status key behind, so
+    // a removed employee still reports status `Active`. The record check must
+    // still win, otherwise a re-registered stranger could be paid by accident.
+    let (_env, client, company_id, employee) = setup_with_employee();
+    client.remove_employee(&company_id, &employee);
+
+    let assessment = client.evaluate_eligibility(&company_id, &employee);
+
+    assert_eq!(
+        client.get_employee_status(&company_id, &employee),
+        EmployeeStatus::Active
+    );
+    assert!(!assessment.eligible);
+    assert_eq!(assessment.reason, EligibilityReason::Unregistered);
+}
+
+#[test]
+fn test_evaluate_eligibility_agrees_with_is_eligible_for_every_status() {
+    let (_env, client, company_id, employee) = setup_with_employee();
+    let statuses = [
+        EmployeeStatus::Active,
+        EmployeeStatus::Suspended,
+        EmployeeStatus::Incomplete,
+    ];
+
+    for status in statuses {
+        client.set_employee_status(&company_id, &employee, &status);
+
+        let assessment = client.evaluate_eligibility(&company_id, &employee);
+
+        assert_eq!(
+            assessment.eligible,
+            client.is_eligible(&company_id, &employee),
+            "eligible flag diverged from is_eligible for status {status:?}"
+        );
+        assert_eq!(
+            assessment.eligible,
+            client.is_employee_active(&company_id, &employee),
+            "eligible flag diverged from is_employee_active for status {status:?}"
+        );
+        assert_eq!(
+            assessment.eligible,
+            assessment.reason == EligibilityReason::Eligible
+        );
+    }
+}
+
+#[test]
+fn test_require_eligible_returns_status_for_eligible_employee() {
+    let (_env, client, company_id, employee) = setup_with_employee();
+
+    assert_eq!(
+        client.require_eligible(&company_id, &employee),
+        EmployeeStatus::Active
+    );
+}
+
+#[test]
+#[should_panic(expected = "employee is not registered with this company")]
+fn test_require_eligible_rejects_unregistered_employee() {
+    let (env, client, company_id, _employee) = setup_with_employee();
+    let stranger = Address::generate(&env);
+
+    client.require_eligible(&company_id, &stranger);
+}
+
+#[test]
+#[should_panic(expected = "employee is suspended")]
+fn test_require_eligible_rejects_suspended_employee() {
+    let (_env, client, company_id, employee) = setup_with_employee();
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Suspended);
+
+    client.require_eligible(&company_id, &employee);
+}
+
+#[test]
+#[should_panic(expected = "employee is offboarded")]
+fn test_require_eligible_rejects_offboarded_employee() {
+    let (_env, client, company_id, employee) = setup_with_employee();
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Offboarded);
+
+    client.require_eligible(&company_id, &employee);
+}
+
+#[test]
+fn test_each_ineligibility_reason_explains_its_remediation() {
+    let reasons = [
+        EligibilityReason::Eligible,
+        EligibilityReason::Unregistered,
+        EligibilityReason::Incomplete,
+        EligibilityReason::Suspended,
+        EligibilityReason::Offboarded,
+    ];
+
+    let mut seen: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for reason in reasons {
+        let message = reason.as_str();
+        assert!(!message.is_empty(), "{reason:?} must explain itself");
+        assert!(
+            !seen.contains(&message),
+            "{reason:?} reuses another reason's message"
+        );
+        seen.push(message);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Event emission tests
 // ---------------------------------------------------------------------------
 
@@ -399,16 +611,15 @@ fn test_register_company_emits_event() {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
 
-    let before = env.events().all().len();
     let company_id = client.register_company(&admin, &treasury);
-    let after = env.events().all().len();
-    assert_eq!(after, before + 1);
+    let after = event_count(&env);
+    assert_eq!(after, 1, "registration must emit exactly one event");
 
-    let event = env.events().all().get(after - 1).unwrap();
-    assert_eq!(event.1.len(), 2);
-    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    let topics = event_topics(&env, after - 1);
+    assert_eq!(topics.len(), 2);
+    let sym0: Symbol = topics.get(0).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(sym0, Symbol::new(&env, "CompanyRegistered"));
-    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    let comp_id: u64 = topics.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
 }
 
@@ -422,18 +633,17 @@ fn test_add_employee_emits_event() {
     let commitment = BytesN::from_array(&env, &[1u8; 32]);
 
     let company_id = client.register_company(&admin, &treasury);
-    let before = env.events().all().len();
     client.add_employee(&company_id, &employee, &commitment);
-    let after = env.events().all().len();
-    assert_eq!(after, before + 1);
+    let after = event_count(&env);
+    assert_eq!(after, 1);
 
-    let event = env.events().all().get(after - 1).unwrap();
-    assert_eq!(event.1.len(), 3);
-    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    let topics = event_topics(&env, after - 1);
+    assert_eq!(topics.len(), 3);
+    let sym0: Symbol = topics.get(0).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(sym0, Symbol::new(&env, "EmployeeAdded"));
-    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    let comp_id: u64 = topics.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
-    let emp_addr: Address = event.1.get(2).unwrap().try_into_val(&env.clone()).unwrap();
+    let emp_addr: Address = topics.get(2).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(emp_addr, employee);
 }
 
@@ -448,18 +658,17 @@ fn test_remove_employee_emits_event() {
 
     let company_id = client.register_company(&admin, &treasury);
     client.add_employee(&company_id, &employee, &commitment);
-    let before = env.events().all().len();
     client.remove_employee(&company_id, &employee);
-    let after = env.events().all().len();
-    assert_eq!(after, before + 1);
+    let after = event_count(&env);
+    assert_eq!(after, 1, "removal must emit exactly one event");
 
-    let event = env.events().all().get(after - 1).unwrap();
-    assert_eq!(event.1.len(), 3);
-    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    let topics = event_topics(&env, after - 1);
+    assert_eq!(topics.len(), 3);
+    let sym0: Symbol = topics.get(0).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(sym0, Symbol::new(&env, "EmployeeRemoved"));
-    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    let comp_id: u64 = topics.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
-    let emp_addr: Address = event.1.get(2).unwrap().try_into_val(&env.clone()).unwrap();
+    let emp_addr: Address = topics.get(2).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(emp_addr, employee);
 }
 
@@ -475,18 +684,17 @@ fn test_update_commitment_emits_event() {
 
     let company_id = client.register_company(&admin, &treasury);
     client.add_employee(&company_id, &employee, &old_commitment);
-    let before = env.events().all().len();
     client.update_commitment(&company_id, &employee, &new_commitment);
-    let after = env.events().all().len();
-    assert_eq!(after, before + 1);
+    let after = event_count(&env);
+    assert_eq!(after, 1, "commitment update must emit exactly one event");
 
-    let event = env.events().all().get(after - 1).unwrap();
-    assert_eq!(event.1.len(), 3);
-    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    let topics = event_topics(&env, after - 1);
+    assert_eq!(topics.len(), 3);
+    let sym0: Symbol = topics.get(0).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(sym0, Symbol::new(&env, "CommitmentUpdated"));
-    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    let comp_id: u64 = topics.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
-    let emp_addr: Address = event.1.get(2).unwrap().try_into_val(&env.clone()).unwrap();
+    let emp_addr: Address = topics.get(2).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(emp_addr, employee);
 }
 
@@ -501,18 +709,21 @@ fn test_deactivate_employee_emits_lifecycle_event() {
 
     let company_id = client.register_company(&admin, &treasury);
     client.add_employee(&company_id, &employee, &commitment);
-    let before = env.events().all().len();
     client.set_employee_status(&company_id, &employee, &EmployeeStatus::Suspended);
-    let after = env.events().all().len();
-    assert_eq!(after, before + 1);
+    let after = event_count(&env);
+    // The suspension event, then the `EmployeeDeactivated` lifecycle event.
+    assert_eq!(
+        after, 2,
+        "suspension must emit the suspension and lifecycle events"
+    );
 
-    let event = env.events().all().get(after - 1).unwrap();
-    assert_eq!(event.1.len(), 3);
-    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    let topics = event_topics(&env, after - 1);
+    assert_eq!(topics.len(), 3);
+    let sym0: Symbol = topics.get(0).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(sym0, Symbol::new(&env, "EmployeeDeactivated"));
-    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    let comp_id: u64 = topics.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
-    let emp_addr: Address = event.1.get(2).unwrap().try_into_val(&env.clone()).unwrap();
+    let emp_addr: Address = topics.get(2).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(emp_addr, employee);
 }
 
@@ -528,18 +739,21 @@ fn test_reactivate_employee_emits_lifecycle_event() {
     let company_id = client.register_company(&admin, &treasury);
     client.add_employee(&company_id, &employee, &commitment);
     client.set_employee_status(&company_id, &employee, &EmployeeStatus::Suspended);
-    let before = env.events().all().len();
     client.set_employee_status(&company_id, &employee, &EmployeeStatus::Active);
-    let after = env.events().all().len();
-    assert_eq!(after, before + 1);
+    let after = event_count(&env);
+    // The activation event, then the `EmployeeReactivated` lifecycle event.
+    assert_eq!(
+        after, 2,
+        "reactivation must emit the activation and lifecycle events"
+    );
 
-    let event = env.events().all().get(after - 1).unwrap();
-    assert_eq!(event.1.len(), 3);
-    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    let topics = event_topics(&env, after - 1);
+    assert_eq!(topics.len(), 3);
+    let sym0: Symbol = topics.get(0).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(sym0, Symbol::new(&env, "EmployeeReactivated"));
-    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    let comp_id: u64 = topics.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
-    let emp_addr: Address = event.1.get(2).unwrap().try_into_val(&env.clone()).unwrap();
+    let emp_addr: Address = topics.get(2).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(emp_addr, employee);
 }
 
@@ -779,15 +993,14 @@ fn test_propose_treasury_rotation_emits_event() {
     let company_id = client.register_company(&admin, &treasury);
     let new_treasury = Address::generate(&env);
 
-    let before = env.events().all().len();
     client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
-    let after = env.events().all().len();
-    assert_eq!(after, before + 1);
+    let after = event_count(&env);
+    assert_eq!(after, 1, "propose must emit exactly one event");
 
-    let event = env.events().all().get(after - 1).unwrap();
-    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    let topics = event_topics(&env, after - 1);
+    let sym0: Symbol = topics.get(0).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(sym0, Symbol::new(&env, "TreasuryRotationProposed"));
-    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    let comp_id: u64 = topics.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
 }
 
@@ -802,15 +1015,18 @@ fn test_accept_treasury_rotation_emits_event() {
 
     client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
 
-    let before = env.events().all().len();
     client.accept_treasury_rotation(&company_id, &new_treasury);
-    let after = env.events().all().len();
-    assert_eq!(after, before + 1);
+    let after = event_count(&env);
+    // `TreasuryRotated` first, then the admin config version bump.
+    assert_eq!(
+        after, 2,
+        "accept must emit TreasuryRotated and a config version update"
+    );
 
-    let event = env.events().all().get(after - 1).unwrap();
-    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    let topics = event_topics(&env, 0);
+    let sym0: Symbol = topics.get(0).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(sym0, Symbol::new(&env, "TreasuryRotated"));
-    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    let comp_id: u64 = topics.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
 
     let company = client.get_company(&company_id);
@@ -828,15 +1044,14 @@ fn test_cancel_treasury_rotation_emits_event() {
 
     client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
 
-    let before = env.events().all().len();
     client.cancel_treasury_rotation(&company_id, &admin);
-    let after = env.events().all().len();
-    assert_eq!(after, before + 1);
+    let after = event_count(&env);
+    assert_eq!(after, 1, "cancel must emit exactly one event");
 
-    let event = env.events().all().get(after - 1).unwrap();
-    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    let topics = event_topics(&env, after - 1);
+    let sym0: Symbol = topics.get(0).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(sym0, Symbol::new(&env, "TreasuryRotationCancelled"));
-    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    let comp_id: u64 = topics.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
 }
 

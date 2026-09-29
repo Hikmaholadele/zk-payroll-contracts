@@ -42,6 +42,62 @@ pub enum EmployeeStatus {
     Offboarded = 3,
 }
 
+// -- Issue #615: employee eligibility status evaluation ------------------------
+
+/// Why an employee is, or is not, eligible for payroll execution.
+///
+/// Integrators previously had only `is_eligible`, a bare boolean that could not
+/// distinguish "never registered" from "suspended", so a rejected payout was
+/// impossible to explain off-chain. Each variant maps to one remediation.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum EligibilityReason {
+    /// Registered and `Active` — may be included in a payroll run.
+    Eligible = 0,
+    /// No employee record exists for this address under this company.
+    Unregistered = 1,
+    /// Registered, but required registration data is still missing.
+    Incomplete = 2,
+    /// Temporarily ineligible, e.g. the employee is on leave.
+    Suspended = 3,
+    /// Permanently ineligible; the record is retained for audit only.
+    Offboarded = 4,
+}
+
+impl EligibilityReason {
+    /// Human-readable explanation, for panic messages and client output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EligibilityReason::Eligible => "eligible",
+            EligibilityReason::Unregistered => {
+                "employee is not registered with this company; onboard the employee first"
+            }
+            EligibilityReason::Incomplete => {
+                "employee record is incomplete; complete registration and set status to Active"
+            }
+            EligibilityReason::Suspended => {
+                "employee is suspended; reactivate the employee to restore eligibility"
+            }
+            EligibilityReason::Offboarded => {
+                "employee is offboarded; this record is retained for audit only and cannot be reactivated"
+            }
+        }
+    }
+}
+
+/// Structured verdict describing one employee's payroll eligibility (#615).
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EligibilityAssessment {
+    /// Stored status, defaulting to `Incomplete` when never set.
+    pub status: EmployeeStatus,
+    /// The single reason that determines eligibility.
+    pub reason: EligibilityReason,
+    /// Convenience flag; always agrees with `reason == Eligible`.
+    pub eligible: bool,
+}
+
 // ?? Issue #91: privileged-role rotation ??????????????????????????????????????
 
 /// Pending two-step company admin or treasury rotation.
@@ -201,6 +257,18 @@ pub trait PayrollRegistryTrait {
 
     /// Read-only helper for clients that only need active/suspended state.
     fn is_employee_active(env: Env, company_id: u64, employee: Address) -> bool;
+
+    /// Evaluate payroll eligibility and report *why*, not just whether (#615).
+    ///
+    /// Purely read-only: no auth, no state change. `eligible` agrees with
+    /// `reason == Eligible`, so this is a strict superset of `is_eligible`.
+    fn evaluate_eligibility(env: Env, company_id: u64, employee: Address) -> EligibilityAssessment;
+
+    /// Assert eligibility, returning the status on success.
+    ///
+    /// Panics with an actionable message naming the remediation when the
+    /// employee cannot be paid, so a failed call tells the caller what to fix.
+    fn require_eligible(env: Env, company_id: u64, employee: Address) -> EmployeeStatus;
 
     // ?? Issue #91: company-level admin/treasury rotation ?????????????????????
 
@@ -765,19 +833,52 @@ impl PayrollRegistryTrait for PayrollRegistry {
     }
 
     fn is_employee_active(env: Env, company_id: u64, employee: Address) -> bool {
-        if !env
+        Self::evaluate_eligibility(env, company_id, employee).eligible
+    }
+
+    fn evaluate_eligibility(env: Env, company_id: u64, employee: Address) -> EligibilityAssessment {
+        let registered = env
             .storage()
             .persistent()
-            .has(&DataKey::Employee(company_id, employee.clone()))
-        {
-            return false;
-        }
+            .has(&DataKey::Employee(company_id, employee.clone()));
         let status: EmployeeStatus = env
             .storage()
             .persistent()
             .get(&DataKey::EmpStatus(company_id, employee))
             .unwrap_or(EmployeeStatus::Incomplete);
-        status == EmployeeStatus::Active
+
+        // An employee record is a precondition for *every* status, including
+        // `Active`, so an address that was never onboarded can never be paid
+        // even if a status key was written for it out of band.
+        let (reason, eligible) = if !registered {
+            (EligibilityReason::Unregistered, false)
+        } else {
+            match status {
+                EmployeeStatus::Active => (EligibilityReason::Eligible, true),
+                EmployeeStatus::Suspended => (EligibilityReason::Suspended, false),
+                EmployeeStatus::Incomplete => (EligibilityReason::Incomplete, false),
+                EmployeeStatus::Offboarded => (EligibilityReason::Offboarded, false),
+            }
+        };
+
+        EligibilityAssessment {
+            status,
+            reason,
+            eligible,
+        }
+    }
+
+    fn require_eligible(env: Env, company_id: u64, employee: Address) -> EmployeeStatus {
+        let assessment = Self::evaluate_eligibility(env.clone(), company_id, employee.clone());
+        if assessment.eligible {
+            return assessment.status;
+        }
+        panic!(
+            "Employee {:?} is not eligible for payroll in company {}: {}",
+            employee,
+            company_id,
+            assessment.reason.as_str()
+        );
     }
 
     // ?? Issue #91: company-level admin/treasury rotation ?????????????????????
