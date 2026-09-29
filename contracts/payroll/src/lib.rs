@@ -1302,7 +1302,7 @@ impl Payroll {
 
     /// Boolean convenience wrapper around `check_execution_initiator`
     /// (issue #620).
-    pub fn is_execution_initiator_authorized(e: Env, initiator: Address) -> bool {
+    pub fn is_execution_initiator(e: Env, initiator: Address) -> bool {
         execution_authorization::check(&e, &initiator).authorized
     }
 
